@@ -1,0 +1,348 @@
+"""
+============================================================
+  EXPANSION AND COMPRESSION BRIDGE - RAILWAY PLATFORM
+  Integrated Hardware & Software Project
+============================================================
+  Components:
+    - Vibration Sensor (SW-420 or MPU-6050)
+    - Sound Sensor (KY-038 or MAX9814 Microphone)
+    - Ultrasonic Sensor (HC-SR04) - user detection
+    - Servo Motor / Stepper Motor - bridge extension
+    - Arduino UNO / Raspberry Pi
+    - AI (Sound Recognition using ML)
+    - Push Button (Emergency Stop)
+    - LCD Display (16x2)
+    - Buzzer (Alert)
+============================================================
+"""
+
+import time
+import numpy as np
+import RPi.GPIO as GPIO
+import smbus  # For I2C communication with MPU-6050
+
+# ─────────────────────────────────────────────────────────
+# PIN CONFIGURATION (Raspberry Pi GPIO)
+# ─────────────────────────────────────────────────────────
+VIBRATION_PIN       = 17   # SW-420 Vibration Sensor (Digital)
+SOUND_SENSOR_PIN    = 27   # KY-038 Sound Sensor (Analog via MCP3008)
+TRIG_PIN            = 23   # HC-SR04 Trigger
+ECHO_PIN            = 24   # HC-SR04 Echo
+MOTOR_IN1           = 5    # Motor Driver IN1 (Bridge Extend)
+MOTOR_IN2           = 6    # Motor Driver IN2 (Bridge Compress)
+MOTOR_EN            = 13   # Motor Enable (PWM)
+EMERGENCY_STOP_PIN  = 26   # Push Button Emergency Stop
+BUZZER_PIN          = 19   # Buzzer Alert
+LED_GREEN           = 16   # Status LED (Green - Safe)
+LED_RED             = 20   # Status LED (Red - Train Approaching)
+
+# ─────────────────────────────────────────────────────────
+# THRESHOLDS & CONSTANTS
+# ─────────────────────────────────────────────────────────
+VIBRATION_THRESHOLD     = 1        # 1 = train vibration detected
+USER_DETECT_DISTANCE_CM = 100      # Detect user within 100 cm
+TRAIN_SOUND_FREQ_MIN    = 200      # Hz - Train horn lower bound
+TRAIN_SOUND_FREQ_MAX    = 800      # Hz - Train horn upper bound
+BRIDGE_EXTEND_TIME      = 5        # Seconds to fully extend bridge
+BRIDGE_COMPRESS_TIME    = 5        # Seconds to fully compress bridge
+SAFETY_COMPRESS_DISTANCE = 50      # Compress bridge when train < 50cm
+STANDBY_TIMEOUT         = 30       # Seconds before returning to standby
+
+
+# ─────────────────────────────────────────────────────────
+# GPIO SETUP
+# ─────────────────────────────────────────────────────────
+def setup_gpio():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+
+    GPIO.setup(VIBRATION_PIN,      GPIO.IN)
+    GPIO.setup(TRIG_PIN,           GPIO.OUT)
+    GPIO.setup(ECHO_PIN,           GPIO.IN)
+    GPIO.setup(MOTOR_IN1,          GPIO.OUT)
+    GPIO.setup(MOTOR_IN2,          GPIO.OUT)
+    GPIO.setup(MOTOR_EN,           GPIO.OUT)
+    GPIO.setup(EMERGENCY_STOP_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(BUZZER_PIN,         GPIO.OUT)
+    GPIO.setup(LED_GREEN,          GPIO.OUT)
+    GPIO.setup(LED_RED,            GPIO.OUT)
+
+    GPIO.output(MOTOR_IN1,  GPIO.LOW)
+    GPIO.output(MOTOR_IN2,  GPIO.LOW)
+    GPIO.output(BUZZER_PIN, GPIO.LOW)
+    GPIO.output(LED_GREEN,  GPIO.LOW)
+    GPIO.output(LED_RED,    GPIO.LOW)
+
+    print("[SETUP] GPIO Initialized Successfully.")
+
+
+# ─────────────────────────────────────────────────────────
+# ULTRASONIC SENSOR - USER DETECTION
+# ─────────────────────────────────────────────────────────
+def measure_distance_cm():
+    """Returns distance in centimeters using HC-SR04."""
+    GPIO.output(TRIG_PIN, GPIO.LOW)
+    time.sleep(0.002)
+    GPIO.output(TRIG_PIN, GPIO.HIGH)
+    time.sleep(0.00001)
+    GPIO.output(TRIG_PIN, GPIO.LOW)
+
+    pulse_start = time.time()
+    pulse_end   = time.time()
+
+    while GPIO.input(ECHO_PIN) == 0:
+        pulse_start = time.time()
+    while GPIO.input(ECHO_PIN) == 1:
+        pulse_end = time.time()
+
+    pulse_duration = pulse_end - pulse_start
+    distance = pulse_duration * 17150  # Speed of sound / 2
+    return round(distance, 2)
+
+
+def is_user_detected():
+    dist = measure_distance_cm()
+    print(f"[SENSOR] Distance: {dist} cm")
+    return dist < USER_DETECT_DISTANCE_CM
+
+
+# ─────────────────────────────────────────────────────────
+# VIBRATION SENSOR - TRAIN DETECTION
+# ─────────────────────────────────────────────────────────
+def is_vibration_detected():
+    """Returns True if vibration from train is detected."""
+    reading = GPIO.input(VIBRATION_PIN)
+    if reading == VIBRATION_THRESHOLD:
+        print("[SENSOR] Vibration Detected!")
+        return True
+    return False
+
+
+# ─────────────────────────────────────────────────────────
+# AI SOUND RECOGNITION - TRAIN HORN DETECTION
+# Using FFT-based frequency analysis (simple ML approach)
+# ─────────────────────────────────────────────────────────
+def capture_audio_sample(duration=1.0, sample_rate=16000):
+    """
+    Captures audio from microphone.
+    In real hardware: use sounddevice or pyaudio.
+    Returns numpy array of audio samples.
+    """
+    try:
+        import sounddevice as sd
+        audio = sd.rec(int(duration * sample_rate),
+                       samplerate=sample_rate,
+                       channels=1, dtype='float32')
+        sd.wait()
+        return audio.flatten()
+    except Exception as e:
+        print(f"[AUDIO] Capture error: {e}")
+        return np.zeros(int(duration * sample_rate))
+
+
+def analyze_sound_for_train(audio_samples, sample_rate=16000):
+    """
+    FFT-based analysis to detect train horn frequencies.
+    Returns True if dominant frequency matches train horn range.
+    """
+    if len(audio_samples) == 0:
+        return False
+
+    fft_result   = np.fft.fft(audio_samples)
+    fft_freq     = np.fft.fftfreq(len(audio_samples), d=1.0 / sample_rate)
+    magnitude    = np.abs(fft_result)
+
+    # Only positive frequencies
+    pos_mask     = fft_freq > 0
+    pos_freq     = fft_freq[pos_mask]
+    pos_mag      = magnitude[pos_mask]
+
+    dominant_freq = pos_freq[np.argmax(pos_mag)]
+    print(f"[AI] Dominant Frequency: {dominant_freq:.2f} Hz")
+
+    if TRAIN_SOUND_FREQ_MIN <= dominant_freq <= TRAIN_SOUND_FREQ_MAX:
+        print("[AI] Train Horn Detected!")
+        return True
+    return False
+
+
+def is_train_approaching():
+    """
+    Combined detection: vibration + sound AI analysis.
+    Returns True if train is approaching.
+    """
+    vibration = is_vibration_detected()
+    audio     = capture_audio_sample(duration=1.0)
+    sound     = analyze_sound_for_train(audio)
+
+    # Alert if either sensor detects train
+    if vibration or sound:
+        print("[ALERT] Train Approaching! Initiating safety protocol.")
+        return True
+    return False
+
+
+# ─────────────────────────────────────────────────────────
+# MOTOR CONTROL - BRIDGE EXTENSION / COMPRESSION
+# ─────────────────────────────────────────────────────────
+def extend_bridge():
+    """Extends the bridge for user crossing."""
+    print("[BRIDGE] Extending bridge...")
+    buzzer_beep(times=2)
+    GPIO.output(LED_GREEN, GPIO.HIGH)
+    GPIO.output(LED_RED,   GPIO.LOW)
+    GPIO.output(MOTOR_IN1, GPIO.HIGH)
+    GPIO.output(MOTOR_IN2, GPIO.LOW)
+    GPIO.output(MOTOR_EN,  GPIO.HIGH)
+    time.sleep(BRIDGE_EXTEND_TIME)
+    motor_stop()
+    print("[BRIDGE] Bridge fully extended.")
+
+
+def compress_bridge():
+    """Compresses the bridge before train arrival."""
+    print("[BRIDGE] Compressing bridge...")
+    buzzer_beep(times=3)
+    GPIO.output(LED_GREEN, GPIO.LOW)
+    GPIO.output(LED_RED,   GPIO.HIGH)
+    GPIO.output(MOTOR_IN1, GPIO.LOW)
+    GPIO.output(MOTOR_IN2, GPIO.HIGH)
+    GPIO.output(MOTOR_EN,  GPIO.HIGH)
+    time.sleep(BRIDGE_COMPRESS_TIME)
+    motor_stop()
+    print("[BRIDGE] Bridge fully compressed.")
+
+
+def motor_stop():
+    GPIO.output(MOTOR_IN1, GPIO.LOW)
+    GPIO.output(MOTOR_IN2, GPIO.LOW)
+    GPIO.output(MOTOR_EN,  GPIO.LOW)
+
+
+# ─────────────────────────────────────────────────────────
+# BUZZER ALERT
+# ─────────────────────────────────────────────────────────
+def buzzer_beep(times=1, duration=0.3):
+    for _ in range(times):
+        GPIO.output(BUZZER_PIN, GPIO.HIGH)
+        time.sleep(duration)
+        GPIO.output(BUZZER_PIN, GPIO.LOW)
+        time.sleep(0.1)
+
+
+# ─────────────────────────────────────────────────────────
+# EMERGENCY STOP
+# ─────────────────────────────────────────────────────────
+def check_emergency_stop():
+    """Returns True if emergency stop button is pressed."""
+    return GPIO.input(EMERGENCY_STOP_PIN) == GPIO.LOW
+
+
+# ─────────────────────────────────────────────────────────
+# BRIDGE STATE MACHINE
+# ─────────────────────────────────────────────────────────
+class BridgeState:
+    STANDBY   = "STANDBY"
+    EXTENDING = "EXTENDING"
+    EXTENDED  = "EXTENDED"
+    COMPRESSING = "COMPRESSING"
+    EMERGENCY = "EMERGENCY"
+
+
+class BridgeController:
+    def __init__(self):
+        self.state            = BridgeState.STANDBY
+        self.last_user_time   = 0
+        print("[SYSTEM] Bridge Controller Initialized. State: STANDBY")
+
+    def run(self):
+        """Main control loop."""
+        while True:
+            try:
+                # ── EMERGENCY STOP ──────────────────────────────
+                if check_emergency_stop():
+                    self._emergency_stop()
+                    continue
+
+                # ── STANDBY STATE ───────────────────────────────
+                if self.state == BridgeState.STANDBY:
+                    print("[STATE] Standby - Waiting for user...")
+                    if is_user_detected():
+                        # Check if train is NOT approaching
+                        if not is_train_approaching():
+                            self.state = BridgeState.EXTENDING
+                        else:
+                            print("[WARNING] Train approaching! Cannot extend bridge.")
+                            buzzer_beep(times=5)
+                    time.sleep(1)
+
+                # ── EXTENDING STATE ─────────────────────────────
+                elif self.state == BridgeState.EXTENDING:
+                    print("[STATE] Extending Bridge...")
+                    extend_bridge()
+                    self.state          = BridgeState.EXTENDED
+                    self.last_user_time = time.time()
+
+                # ── EXTENDED STATE ──────────────────────────────
+                elif self.state == BridgeState.EXTENDED:
+                    print("[STATE] Bridge Extended - Monitoring...")
+
+                    # Check for train while bridge is extended
+                    if is_train_approaching():
+                        print("[CRITICAL] Train detected while bridge extended!")
+                        buzzer_beep(times=10)
+                        self.state = BridgeState.COMPRESSING
+
+                    # Auto-compress after user has crossed (timeout)
+                    elif time.time() - self.last_user_time > STANDBY_TIMEOUT:
+                        if not is_user_detected():
+                            print("[INFO] No user on bridge. Auto-compressing.")
+                            self.state = BridgeState.COMPRESSING
+
+                    time.sleep(0.5)
+
+                # ── COMPRESSING STATE ────────────────────────────
+                elif self.state == BridgeState.COMPRESSING:
+                    print("[STATE] Compressing Bridge...")
+                    compress_bridge()
+                    self.state = BridgeState.STANDBY
+
+            except KeyboardInterrupt:
+                print("\n[SYSTEM] Shutdown signal received.")
+                self._cleanup()
+                break
+
+    def _emergency_stop(self):
+        """Handles emergency stop - immediately stops motor."""
+        print("[EMERGENCY] Emergency Stop Activated!")
+        motor_stop()
+        GPIO.output(LED_RED, GPIO.HIGH)
+        buzzer_beep(times=5, duration=0.5)
+        self.state = BridgeState.EMERGENCY
+        time.sleep(2)
+        # Reset after emergency
+        GPIO.output(LED_RED, GPIO.LOW)
+        self.state = BridgeState.STANDBY
+        print("[SYSTEM] Emergency resolved. Returning to Standby.")
+
+    def _cleanup(self):
+        motor_stop()
+        GPIO.output(LED_GREEN, GPIO.LOW)
+        GPIO.output(LED_RED,   GPIO.LOW)
+        GPIO.output(BUZZER_PIN, GPIO.LOW)
+        GPIO.cleanup()
+        print("[SYSTEM] GPIO Cleanup Done. System OFF.")
+
+
+# ─────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  EXPANSION & COMPRESSION BRIDGE SYSTEM")
+    print("  Railway Platform Safety Project")
+    print("=" * 60)
+
+    setup_gpio()
+    controller = BridgeController()
+    controller.run()
